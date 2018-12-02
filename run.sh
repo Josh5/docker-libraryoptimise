@@ -12,5 +12,5 @@ docker run -ti --rm \
     -e LIBRARY_PATH=/library \
     -e DEBUGGING=false \
     -e SUPPORTED_CONTAINERS='avi,mkv' \
-    josh5/libraryoptimiser:latest 
+    josh5/libraryoptimise:latest 
 

@@ -1,5 +1,5 @@
 
-# josh5/libraryoptimiser
+# josh5/libraryoptimise
 
 ### A simple container for optimising your library.
 This container will monitor your video library using inotify. When a video is added that matches a configured list of extensions it will be processed. If the video is already the correct destination codec, it will be left alone. Otherwise it will be be re-encoded and replaced.
