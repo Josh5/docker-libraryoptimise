@@ -2,9 +2,7 @@
 
 
 #TODO:
-# import SUPPORTED_CONTAINERS from env var
-# Implement proper logging
-# Add Inotify wait on files (when complete library is converted, then we want to watch it for changes)
+# Improve basic logging (non-debugging) so it is easier to follow what is actally happening
 # 
 # Available codecs: 
 #       ffmpeg -loglevel quiet -encoders | grep -o '^ V\..*' | grep -v '= Video'
@@ -141,6 +139,7 @@ Settings:
 
     # Debugging
         Enabled:                            {7}
+
 '''.format(
         LIBRARY_PATH,
         CACHE_PATH,
@@ -153,7 +152,7 @@ Settings:
         AUDIO_STEREO_STREAM_BITRATE,
         SCHEDULE_FULL_SCAN_MINS,
     )
-print(__config)
+_log(__config)
 
 ### RUN!
 _log("Processing files in '{}'".format(LIBRARY_PATH))
@@ -313,7 +312,7 @@ def convert_file(input_file,output_file):
     # Specify output file
     command = command + ["-y", output_file]
 
-    if True:
+    if DEBUGGING:
         _log(" ".join(command))
 
     try:
@@ -420,23 +419,20 @@ class ScheduledTask(threading.Thread):
         # If we have a config set to run a schedule, then start the process.
         # Otherwise close this thread now.
         if SCHEDULE_FULL_SCAN_MINS:
-            print ("Starting " + self.name)
+            _log("Starting " + self.name)
 
+            # Configure schedule
             schedule.every(int(SCHEDULE_FULL_SCAN_MINS)).minutes.do(scheduled_job)
-            # schedule.every().hour.do(scheduled_job)
-            # schedule.every().day.at("10:30").do(scheduled_job)
-            # schedule.every(5).to(10).minutes.do(scheduled_job)
-            # schedule.every().monday.do(scheduled_job)
-            # schedule.every().wednesday.at("13:15").do(scheduled_job)
 
             # First run the task
             scheduled_job()
+
             # Then loop and wait for the schedule
             while not self.shutdown_flag.is_set():
                 schedule.run_pending()
                 time.sleep(1)
 
-            print ("Stopping " + self.name)
+            _log("Stopping " + self.name)
 
 
 class EventProcessor(pyinotify.ProcessEvent):

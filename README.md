@@ -4,7 +4,7 @@
 ### A simple container for optimising your library.
 This container will monitor your video library using inotify. When a video is added that matches a configured list of extensions it will be processed. If the video is already the correct destination codec, it will be left alone. Otherwise it will be be re-encoded and replaced.
 
-You can also specify a sheduled task to scan your entire library folder for files that need re-encoding. By default this will be carried out on start and every 60 mins afterwards.
+You can also specify a scheduled task to scan your entire library folder for files that need re-encoding. By default this will be carried out on start and every 60 mins afterwards.
 
 This container uses ffmpeg, python schedule and pyinotify.
 
@@ -14,9 +14,11 @@ This container uses ffmpeg, python schedule and pyinotify.
 
 Internally your media library is bound to /library/
 Encoding cache is bound to /cache/
-* Default user "docker"
 
-Additional params to your container:
+All conversion processes are run as the container's default user.
+This can be modified with the PGID and PUID environment variables (see below)
+
+Environment variables:
 
 * `-e PGID` for setting the GroupID of the default user
 * `-e PUID` for setting the UserID of the default user
@@ -24,7 +26,7 @@ Additional params to your container:
     ### Library config
 * `-e LIBRARY_PATH`                     Library location (default /library/)
 * `-e CACHE_PATH`                       Encoder cache location (default /cache/)
-* `-e SUPPORTED_CONTAINERS`             File extensions to minotor in library path
+* `-e SUPPORTED_CONTAINERS`             File extensions within the library path to monitor
     
     ### Video stream config
 * `-e VIDEO_CODEC`                      Destination video codec (default hevc)
