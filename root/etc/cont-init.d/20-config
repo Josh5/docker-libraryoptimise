@@ -1,0 +1,15 @@
+#!/usr/bin/with-contenv bash
+
+CWD=${PWD};
+
+permissions_config() {
+    echo "**** (permissions_config) Settings permissions ****";
+    mkdir -p \
+        /cache
+    chown -R $PUID:$PGID \
+        /cache
+    chmod -R a+w \
+        /cache
+}
+
+permissions_config;

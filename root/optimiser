@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+
+
+#TODO:
+# import SUPPORTED_CONTAINERS from env var
+# Implement proper logging
+# Add Inotify wait on files (when complete library is converted, then we want to watch it for changes)
+# 
+# Available codecs: 
+#       ffmpeg -loglevel quiet -encoders | grep -o '^ V\..*' | grep -v '= Video'
+#       ffmpeg -loglevel quiet -encoders | grep -o '^ A\..*' | grep -v '= Audio'
+
+import os
+import sys
+import json
+import subprocess
+import shutil
+import uuid
+import pyinotify
+import threading
+import time
+import schedule
+
+### DEFAULTS
+LIBRARY_PATH='/library/'
+CACHE_PATH='/cache/'
+VIDEO_CODEC='hevc'
+AUDIO_CODEC='aac'
+OUT_CONTAINER='mkv'
+SUPPORTED_CONTAINERS=('mkv','avi','mov','ts','rmvb','mp4',)
+REMOVE_SUBTITLE_STREAMS=True
+DEBUGGING=False
+AUDIO_STEREO_STREAM_BITRATE='128k'
+SCHEDULE_FULL_SCAN_MINS='60'
+### END DEFAULTS
+
+### CONFIG
+CODEC_CONFIG = {
+    "hevc": {
+        "type":"video",
+        "codec_long_name":"HEVC (High Efficiency Video Coding)",
+        "encoder":"libx265"
+    },
+    "h264": {
+        "type":"video",
+        "codec_long_name":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+        "encoder":"libx264"
+    },
+    "mp3": {
+        "type":"audio",
+        "codec_long_name":"MP3 (MPEG audio layer 3)",
+        "encoder":"libmp3lame"
+    },
+    "aac": {
+        "type":"audio",
+        "codec_long_name":"AAC (Advanced Audio Coding)",
+        "encoder":"aac"
+    }
+}
+
+# Import env variables
+if "LIBRARY_PATH" in os.environ:
+    LIBRARY_PATH = os.environ.get("LIBRARY_PATH")
+if "CACHE_PATH" in os.environ:
+    CACHE_PATH = os.environ.get("CACHE_PATH")
+if "VIDEO_CODEC" in os.environ:
+    VIDEO_CODEC = os.environ.get("VIDEO_CODEC")
+if "AUDIO_CODEC" in os.environ:
+    AUDIO_CODEC = os.environ.get("AUDIO_CODEC")
+if "OUT_CONTAINER" in os.environ:
+    OUT_CONTAINER = os.environ.get("OUT_CONTAINER")
+if "SUPPORTED_CONTAINERS" in os.environ:
+    SUPPORTED_CONTAINERS = tuple(os.environ.get("SUPPORTED_CONTAINERS").split(","))
+if "REMOVE_SUBTITLE_STREAMS" in os.environ:
+    REMOVE_SUBTITLE_STREAMS = True if os.environ.get("REMOVE_SUBTITLE_STREAMS").lower() in ['t','true','1'] else False
+if "DEBUGGING" in os.environ:
+    DEBUGGING = True if os.environ.get("DEBUGGING").lower() in ['t','true','1'] else False
+if "SCHEDULE_FULL_SCAN_MINS" in os.environ:
+    SCHEDULE_FULL_SCAN_MINS = os.environ.get("SCHEDULE_FULL_SCAN_MINS")
+if "AUDIO_STEREO_STREAM_BITRATE" in os.environ:
+    AUDIO_STEREO_STREAM_BITRATE = os.environ.get("AUDIO_STEREO_STREAM_BITRATE")
+
+
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+def _log(message, level="info"):
+    message = "LibraryOptimiser - %s" % message
+    if level == "debug":
+        logging.debug(message);
+    elif level == "info":
+        logging.info(message);
+    elif level == "warning":
+        logging.warning(message);
+
+
+### VALIDATE CONFIG
+if not VIDEO_CODEC in CODEC_CONFIG:
+    _log("Error! Invalid video codec: {}".format(VIDEO_CODEC))
+    _log("Possible video codec options are:")
+    for codec in CODEC_CONFIG:
+        if CODEC_CONFIG[codec]['type'] == 'video':
+            _log("    - '{}'".format(codec))
+    sys.exit(1)
+if not AUDIO_CODEC in CODEC_CONFIG:
+    _log("Error! Invalid audio codec: {}".format(AUDIO_CODEC))
+    _log("Possible audio codec options are:")
+    for codec in CODEC_CONFIG:
+        if CODEC_CONFIG[codec]['type'] == 'audio':
+            _log("    - '{}'".format(codec))
+    sys.exit(1)
+
+
+### Print current config
+__config = '''
+Settings:
+
+    # Library config
+        Library path:                       {0}
+        Cache path:                         {1}
+        Monitored container extensions:     {5}
+    
+    # Video stream config
+    Videos in your library that are not already this codec will be converted
+        Video codec:                        {2}
+    
+    # Audio stream config
+    Create a stereo audio stream if one does not exists
+        Enabled:                            True
+        Dest audio codec:                   {3}
+        Bitrate:                            {8}
+
+    # Container config
+        Dest container:                     {4}
+
+    # Remove subtitle streams from video
+        Enabled:                            {6}
+
+    # Schedule full library scans
+        Run every X minutes:                {9}
+
+    # Debugging
+        Enabled:                            {7}
+'''.format(
+        LIBRARY_PATH,
+        CACHE_PATH,
+        VIDEO_CODEC,
+        AUDIO_CODEC,
+        OUT_CONTAINER,
+        ','.join(SUPPORTED_CONTAINERS),
+        REMOVE_SUBTITLE_STREAMS,
+        DEBUGGING,
+        AUDIO_STEREO_STREAM_BITRATE,
+        SCHEDULE_FULL_SCAN_MINS,
+    )
+print(__config)
+
+### RUN!
+_log("Processing files in '{}'".format(LIBRARY_PATH))
+
+def file_probe(vid_file_path):
+    ''' Give a json from ffprobe command line
+
+    @vid_file_path : The absolute (full) path of the video file, string.
+    '''
+    if type(vid_file_path) != str:
+        raise Exception('Give ffprobe a full file path of the video')
+        return
+
+    command = ["ffprobe",
+            "-loglevel",  "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            vid_file_path
+        ]
+
+    try:
+        pipe = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out, err = pipe.communicate()
+        return json.loads(out.decode("utf-8"))
+    except Exception as e: 
+        _log("Exception - file_probe: {}".format(e))
+        return False
+
+
+def check_file_to_be_processed(vid_file_path):
+    # TODO: Add variable to force conversion based on audio config also
+    file_properties = file_probe(vid_file_path)
+    if not file_properties:
+        # Failed to fetch properties
+        if DEBUGGING:
+            _log("Failed to fetch properties of file {}".format(vid_file_path))
+            _log("Marking file not to be processed")
+        return False
+    for stream in file_properties['streams']:
+        if stream['codec_type'] == 'video':
+            # Check if this file is already the right format
+            if stream['codec_name'] == VIDEO_CODEC:
+                if DEBUGGING:
+                    _log("File already {} - {}".format(VIDEO_CODEC,vid_file_path))
+                return False
+    return True
+
+
+def ensure_dir(file_path):
+    directory = os.path.dirname(file_path)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+
+def convert_file(input_file,output_file):
+    ''' Build the ffmpeg conversion command and execute it
+
+    @input_file : The absolute (full) path of the video file, string.
+    @output_file : The absolute (full) path of temp conversion output file, string.
+    '''
+    # ffmpeg -i /library/XXXXX.mkv \
+    #     -c:v libx265 \
+    #     -map 0:0 -map 0:1 -map 0:1 \
+    #     -c:a:0 copy \
+    #     -c:a:1 libmp3lame -b:a:0 192k -ac 2 \
+    #     -y /cache/XXXXX.mkv
+    # 
+
+    # Read video information for the input file
+    file_properties = file_probe(input_file)
+    if DEBUGGING:
+        _log(json.dumps(file_properties,indent=2))
+
+    # Build Command starting with specifying the input file
+    command = ["ffmpeg", "-i",  input_file]
+
+    # Set output
+    #TODO: Check if we need '-nostats' here also
+    command = command + ["-hide_banner", "-loglevel", "info", "-strict", "-2"]
+
+    # Read stream data
+    streams_to_map      = []
+    streams_to_create   = []
+    audio_tracks_count  = 0
+    for stream in file_properties['streams']:
+        if stream['codec_type'] == 'video':
+            stream_data = stream
+            # Map this stream
+            streams_to_map = streams_to_map + [
+                    "-map",   "0:{}".format(stream['index'])
+                ]
+
+            streams_to_create = streams_to_create + [
+                    "-c:v", CODEC_CONFIG[VIDEO_CODEC]['encoder']
+                ]
+        if stream['codec_type'] == 'audio':
+            # Get details of audio channel:
+            if stream['channels'] > 2:
+                # Map this stream
+                streams_to_map = streams_to_map + [
+                        "-map",   "0:{}".format(stream['index'])
+                    ]
+
+                streams_to_create = streams_to_create + [
+                        "-c:a:{}".format(audio_tracks_count), "copy"
+                    ]
+                audio_tracks_count += 1
+
+                # TODO: Make this optional
+                try:
+                    audio_tag = ''.join([i for i in stream['tags']['title'] if not i.isdigit()]).rstrip('.') + 'Stereo'
+                except:
+                    audio_tag = 'Stereo'
+
+                # Map a duplicated stream
+                streams_to_map = streams_to_map + [
+                        "-map",   " 0:{}".format(stream['index'])
+                    ]
+
+                streams_to_create = streams_to_create + [
+                            "-c:a:{}".format(audio_tracks_count), CODEC_CONFIG[AUDIO_CODEC]['encoder'] ,
+                            "-b:a:{}".format(audio_tracks_count), AUDIO_STEREO_STREAM_BITRATE,
+                            "-ac", "2",
+                            "-metadata:s:a:{}".format(audio_tracks_count), "title='{}'".format(audio_tag),
+                        ]
+            else:
+                # Force conversion of stereo audio to standard
+                streams_to_map = streams_to_map + [
+                        "-map",   " 0:{}".format(stream['index'])
+                    ]
+
+                streams_to_create = streams_to_create + [
+                            "-c:a:{}".format(audio_tracks_count), CODEC_CONFIG[AUDIO_CODEC]['encoder'] ,
+                            "-b:a:{}".format(audio_tracks_count), AUDIO_STEREO_STREAM_BITRATE,
+                            "-ac", "2",
+                        ]
+        if stream['codec_type'] == 'subtitle':
+            if REMOVE_SUBTITLE_STREAMS:
+                continue
+            # Map this stream
+            streams_to_map = streams_to_map + [
+                    "-map",   "0:{}".format(stream['index'])
+                ]
+
+            streams_to_create = streams_to_create + [
+                    "-c:s:{}".format(audio_tracks_count), "copy"
+                ]
+            audio_tracks_count += 1
+
+    # Map streams
+    command = command + streams_to_map
+
+    # Add arguments for creating streams
+    command = command + streams_to_create
+
+    # Specify output file
+    command = command + ["-y", output_file]
+
+    if True:
+        _log(" ".join(command))
+
+    try:
+        subprocess.check_call(command)
+    except subprocess.CalledProcessError:
+        return False
+    except Exception as e: 
+        _log("Exception - file_probe: {}".format(e))
+        _log("Unexpected exit during file conversion")
+        return False
+
+    return True
+
+
+def test_file(vid_file_path):
+    file_properties = file_probe(vid_file_path)
+    if not file_properties:
+        # Failed to fetch properties
+        return False
+    result = False
+    for stream in file_properties['streams']:
+        if stream['codec_type'] == 'video':
+            # Check if this file is the right codec
+            if stream['codec_name'] == VIDEO_CODEC:
+                result = True
+            elif DEBUGGING:
+                _log("File is the not correct codec {} - {}".format(VIDEO_CODEC,vid_file_path))
+            #TODO: Test duration is the same as src
+    return result
+
+
+
+def process_file(vid_file_path):
+    if DEBUGGING:
+        _log("Checking file {}".format(vid_file_path))
+    if not check_file_to_be_processed(vid_file_path):
+        if DEBUGGING:
+            _log("File does not need to be processed - {}".format(vid_file_path))
+        return False
+    # Parse input path
+    srcFile     = os.path.basename(vid_file_path)
+    srcPath     = os.path.abspath(vid_file_path)
+    srcFolder   = os.path.dirname(srcPath)
+    
+    _log("Processing '{}'".format(srcPath))
+    # Parse an output cache path
+    outFile     = "{}.{}".format(os.path.splitext(srcFile)[0], OUT_CONTAINER)
+    outPath     = os.path.join(CACHE_PATH,outFile)
+    # Create output path if not exists 
+    ensure_dir(outPath)
+    # Convert file
+    success = False
+    success = convert_file(srcPath,outPath)
+    if success:
+        # Move file back to original folder and remove source
+        success = test_file(outPath)
+        if success:
+            destPath    = os.path.join(srcFolder,outFile)
+            _log("Moving file {} --> {}".format(outPath,destPath))
+            shutil.move(outPath, destPath)
+            success     = test_file(destPath)
+            if success:
+                # If successful move, remove source
+                #TODO: Add env variable option to keep src
+                if srcPath != destPath:
+                    _log("Removing source: {}".format(srcPath))
+                    os.remove(srcPath)
+    else:
+        _log("Failed processing file '{}'".format(srcPath))
+        return False
+    _log("Successfully processed file '{}'".format(srcPath))
+    return True
+
+
+convert_files = []
+def get_convert_files(search_folder):
+    _log(search_folder)
+    for root, subFolders, files in os.walk(search_folder):
+        if DEBUGGING:
+            _log(json.dumps(files,indent=2))
+        # Add all files in this path that match our container filter
+        for file_path in files:
+            if file_path.lower().endswith(SUPPORTED_CONTAINERS):
+                process_file(os.path.join(root,file_path))
+            else:
+                if DEBUGGING:
+                    _log("Ignoring file due to incorrect suffix - '{}'".format(file_path))
+            
+
+
+
+def scheduled_job():
+    _log("Running scheduled task")
+    get_convert_files(LIBRARY_PATH)
+
+class ScheduledTask(threading.Thread):
+
+    def __init__(self, name):
+        threading.Thread.__init__(self)
+        self.name = name
+        self.shutdown_flag = threading.Event()
+    
+    def run(self):
+        # If we have a config set to run a schedule, then start the process.
+        # Otherwise close this thread now.
+        if SCHEDULE_FULL_SCAN_MINS:
+            print ("Starting " + self.name)
+
+            schedule.every(int(SCHEDULE_FULL_SCAN_MINS)).minutes.do(scheduled_job)
+            # schedule.every().hour.do(scheduled_job)
+            # schedule.every().day.at("10:30").do(scheduled_job)
+            # schedule.every(5).to(10).minutes.do(scheduled_job)
+            # schedule.every().monday.do(scheduled_job)
+            # schedule.every().wednesday.at("13:15").do(scheduled_job)
+
+            # First run the task
+            scheduled_job()
+            # Then loop and wait for the schedule
+            while not self.shutdown_flag.is_set():
+                schedule.run_pending()
+                time.sleep(1)
+
+            print ("Stopping " + self.name)
+
+
+class EventProcessor(pyinotify.ProcessEvent):
+
+    def process_IN_CLOSE_WRITE(self, event):
+        
+        _log("CLOSE_WRITE event detected:", event.pathname)
+        if event.pathname.lower().endswith(SUPPORTED_CONTAINERS):
+            process_file(event.pathname)
+        else:
+            if DEBUGGING:
+                _log("Ignoring file due to incorrect suffix - '{}'".format(event.pathname))
+
+    def process_IN_DELETE(self, event):
+        
+        _log("DELETE event detected:", event.pathname)
+        _log("Nothing to do for this event")
+
+    def process_IN_MOVED_FROM(self, event):
+        
+        _log("MOVED_FROM event detected:", event.pathname)
+        _log("Nothing to do for this event")
+
+
+def main():
+    # start scheduled thread
+    thread = ScheduledTask("ScheduledTask")
+    thread.daemon = True
+    # start threads
+    thread.start()
+
+    # watch manager
+    _log("Starting EventProcessor")
+    wm = pyinotify.WatchManager()
+    wm.add_watch(LIBRARY_PATH, pyinotify.ALL_EVENTS, rec=True)
+
+    # event processor
+    ep = EventProcessor()
+
+    # notifier
+    notifier = pyinotify.ThreadedNotifier(wm, ep)
+    notifier.loop()
+    thread.shutdown_flag.set()
+    _log("Stopping EventProcessor")
+    thread.join()
+    _log("Exit")
+
+if __name__ == '__main__':
+    main()
