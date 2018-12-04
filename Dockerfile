@@ -7,8 +7,6 @@ LABEL maintainer="Josh.5 <jsunnex@gmail.com>"
 ###
 # Set version for pyinotify
 ARG PYINOTIFY_VERSION="0.9.6"
-# Set schedule version
-ARG SCHEDULE_VERSION="0.5.0"
 # Build Dependencies (not required in final image)
 ARG BUILD_DEPENDENCIES=" \
         python3-dev \
@@ -42,6 +40,9 @@ RUN \
     && \
     echo "**** Install schedule ****" \
         && python3 -m pip install --no-cache-dir --upgrade schedule \
+    && \
+    echo "**** Install ffpb ****" \
+        && python3 -m pip install --no-cache-dir --upgrade ffpb \
     && \
     echo "**** cleanup ****" \
         && apt-get purge -y --auto-remove \

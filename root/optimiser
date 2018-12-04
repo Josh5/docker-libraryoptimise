@@ -3,6 +3,8 @@
 
 #TODO:
 # Improve basic logging (non-debugging) so it is easier to follow what is actally happening
+# Update logger to support "workers"
+# Update script to support multiprocessing and assign "workers" and a job queue
 # 
 # Available codecs: 
 #       ffmpeg -loglevel quiet -encoders | grep -o '^ V\..*' | grep -v '= Video'
@@ -55,6 +57,14 @@ CODEC_CONFIG = {
         "encoder":"aac"
     }
 }
+
+PROCESSING_FILE_HEADER = '''New File...
+|---   ---   ---   ---   --->
+|
+|    Processing "{}"
+|
+|---   ---   ---   ---   --->
+'''
 
 # Import env variables
 if "LIBRARY_PATH" in os.environ:
@@ -228,7 +238,11 @@ def convert_file(input_file,output_file):
         _log(json.dumps(file_properties,indent=2))
 
     # Build Command starting with specifying the input file
-    command = ["ffmpeg", "-i",  input_file]
+    if DEBUGGING:
+        ffmpeg_cmd = 'ffmpeg'
+    else:
+        ffmpeg_cmd = 'ffpb'
+    command = [ffmpeg_cmd, '-i',  input_file]
 
     # Set output
     #TODO: Check if we need '-nostats' here also
@@ -357,7 +371,7 @@ def process_file(vid_file_path):
     srcPath     = os.path.abspath(vid_file_path)
     srcFolder   = os.path.dirname(srcPath)
     
-    _log("Processing '{}'".format(srcPath))
+    _log(PROCESSING_FILE_HEADER.format(srcPath))
     # Parse an output cache path
     outFile     = "{}.{}".format(os.path.splitext(srcFile)[0], OUT_CONTAINER)
     outPath     = os.path.join(CACHE_PATH,outFile)
